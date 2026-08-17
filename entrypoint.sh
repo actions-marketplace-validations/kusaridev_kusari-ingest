@@ -1,5 +1,11 @@
 #!/bin/sh
 set -e
+# Disable pathname (glob) expansion. The script word-splits a few
+# user-supplied strings (notably ${WAYBILL_ARGS}) by intentionally
+# leaving them unquoted; without -f those expansions would also be
+# globbed against the workspace, which would silently mutate the
+# user's flags based on what files happen to exist in cwd.
+set -f
 
 # Parse arguments
 FILE_PATH=""
@@ -7,17 +13,30 @@ CLIENT_ID=""
 CLIENT_SECRET=""
 TENANT_ENDPOINT=""
 TOKEN_ENDPOINT="https://auth.us.kusari.cloud/oauth2/token"
+CONSOLE_URL=""
+PLATFORM_URL=""
 ALIAS=""
 DOCUMENT_TYPE=""
 OPEN_VEX="false"
 TAG=""
 SOFTWARE_ID=""
 SBOM_SUBJECT=""
-COMPONENT_NAME=""
 CHECK_BLOCKED_PACKAGES="false"
 SBOM_SUBJECT_NAME_OVERRIDE=""
 SBOM_SUBJECT_VERSION_OVERRIDE=""
 WAIT="true"
+COMMIT_SHA=""
+GENERATE="false"
+SOURCE_PATH=""
+IMAGE=""
+OUTPUT_PATH="project.cdx.json"
+WAYBILL_ARGS=""
+MIKEBOM_ARGS=""
+ROOT_NAME=""
+ROOT_VERSION=""
+NO_ROOT_PURL="false"
+RESULTS_FILE=""
+MAP_COMPONENTS="false"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +54,12 @@ while [ $# -gt 0 ]; do
       ;;
     --token-endpoint=*)
       TOKEN_ENDPOINT="${1#*=}"
+      ;;
+    --console-url=*)
+      CONSOLE_URL="${1#*=}"
+      ;;
+    --platform-url=*)
+      PLATFORM_URL="${1#*=}"
       ;;
     --alias=*)
       ALIAS="${1#*=}"
@@ -54,9 +79,6 @@ while [ $# -gt 0 ]; do
     --sbom-subject=*)
       SBOM_SUBJECT="${1#*=}"
       ;;
-    --component-name=*)
-      COMPONENT_NAME="${1#*=}"
-      ;;
     --check-blocked-packages=*)
       CHECK_BLOCKED_PACKAGES="${1#*=}"
       ;;
@@ -69,15 +91,134 @@ while [ $# -gt 0 ]; do
     --wait=*)
       WAIT="${1#*=}"
       ;;
+    --commit-sha=*)
+      COMMIT_SHA="${1#*=}"
+      ;;
+    --generate=*)
+      GENERATE="${1#*=}"
+      ;;
+    --source-path=*)
+      SOURCE_PATH="${1#*=}"
+      ;;
+    --image=*)
+      IMAGE="${1#*=}"
+      ;;
+    --output-path=*)
+      OUTPUT_PATH="${1#*=}"
+      ;;
+    --waybill-args=*)
+      WAYBILL_ARGS="${1#*=}"
+      ;;
+    --mikebom-args=*)
+      MIKEBOM_ARGS="${1#*=}"
+      ;;
+    --root-name=*)
+      ROOT_NAME="${1#*=}"
+      ;;
+    --root-version=*)
+      ROOT_VERSION="${1#*=}"
+      ;;
+    --no-root-purl=*)
+      NO_ROOT_PURL="${1#*=}"
+      ;;
+    --results-file=*)
+      RESULTS_FILE="${1#*=}"
+      ;;
+    --map-components=*)
+      MAP_COMPONENTS="${1#*=}"
+      ;;
   esac
   shift
 done
 
+# Backwards compatibility: mikebom was renamed to waybill, and the
+# mikebom-args input along with it. Accept the deprecated input as an alias,
+# with waybill-args winning when both are set. ARGS_INPUT_NAME tracks which
+# input supplied the value so validation errors name the one the user set.
+ARGS_INPUT_NAME="waybill-args"
+if [ -n "${MIKEBOM_ARGS}" ]; then
+  if [ -n "${WAYBILL_ARGS}" ]; then
+    echo "WARNING: both waybill-args and mikebom-args (deprecated) are set; using waybill-args and ignoring mikebom-args." >&2
+  else
+    echo "WARNING: the 'mikebom-args' input is deprecated; use 'waybill-args' instead. It will be removed in a future release." >&2
+    WAYBILL_ARGS="${MIKEBOM_ARGS}"
+    ARGS_INPUT_NAME="mikebom-args"
+  fi
+fi
+
+# In upload mode, file-path is required. In generate mode it is unused.
+if [ "${GENERATE}" != "true" ] && [ -z "${FILE_PATH}" ]; then
+  echo "file-path is required when generate is not enabled"
+  exit 1
+fi
+
+# In generate mode, exactly one scan target must be supplied. Setting both
+# would silently let one win; setting neither would hand an empty --path to
+# waybill. Reject both cases up front. Also reject a stray file-path — the
+# action uploads the generated SBOM, so any file-path the caller set would
+# be silently dropped.
+if [ "${GENERATE}" = "true" ]; then
+  if [ -n "${FILE_PATH}" ]; then
+    echo "file-path must not be set when generate is true; the action uploads the generated SBOM"
+    exit 1
+  fi
+  if [ -z "${IMAGE}" ] && [ -z "${SOURCE_PATH}" ]; then
+    echo "one of image or source-path must be set when generate is true"
+    exit 1
+  fi
+  if [ -n "${IMAGE}" ] && [ -n "${SOURCE_PATH}" ]; then
+    echo "image and source-path are mutually exclusive; set only one when generate is true"
+    exit 1
+  fi
+fi
+
+# Users sometimes try to set waybill's --output via waybill-args; that
+# silently desyncs from the file the upload step expects. Refuse the
+# override and point them at the output-path input. Iterate the same way
+# the actual invocation does (unquoted word-splitting) so we catch the
+# flag regardless of which whitespace (spaces, tabs, newlines from a
+# multiline YAML scalar) separates the tokens.
+# shellcheck disable=SC2086
+for token in ${WAYBILL_ARGS}; do
+  case "$token" in
+    --output|--output=*)
+      echo "${ARGS_INPUT_NAME} must not contain --output; use the output-path input instead"
+      exit 1
+      ;;
+    --root-name|--root-name=*)
+      echo "${ARGS_INPUT_NAME} must not contain --root-name; use the root-name input instead"
+      exit 1
+      ;;
+    --root-version|--root-version=*)
+      echo "${ARGS_INPUT_NAME} must not contain --root-version; use the root-version input instead"
+      exit 1
+      ;;
+    --no-root-purl|--no-root-purl=*)
+      echo "${ARGS_INPUT_NAME} must not contain --no-root-purl; use the no-root-purl input instead"
+      exit 1
+      ;;
+  esac
+done
+
 # Fail if CLIENT_ID or CLIENT_SECRET is still empty
-if [ -z "${CLIENT_ID}" ] || [ -z ${CLIENT_SECRET} ]; then
+if [ -z "${CLIENT_ID}" ] || [ -z "${CLIENT_SECRET}" ]; then
   echo "CLIENT_ID or CLIENT_SECRET not provided"
   exit 1
 fi
+
+# The CLI's --results-file requires --wait: the software/component IDs only
+# exist once ingestion completes. Fail fast rather than after generate/upload
+# work has already run.
+if [ "${MAP_COMPONENTS}" = "true" ] && [ "${WAIT}" = "false" ]; then
+  echo "map-components requires wait; leave wait at its default (true)"
+  exit 1
+fi
+
+if [ -n "${RESULTS_FILE}" ] && [ "${WAIT}" = "false" ]; then
+  echo "results-file requires wait; leave wait at its default (true)"
+  exit 1
+fi
+
 
 # Auto-detect repository traceability metadata from GitHub environment variables
 # GITHUB_SERVER_URL: https://github.com or https://github.enterprise.com
@@ -99,9 +240,15 @@ if [ -n "${GITHUB_REPOSITORY}" ]; then
   REPO="${GITHUB_REPOSITORY#*/}"
 fi
 
-# Auto-derive subrepo path from file-path
+# Auto-derive subrepo path. In generate mode it tracks source-path (unless
+# we're scanning an image, in which case there is no meaningful subrepo);
+# otherwise it tracks file-path.
 SUBREPO_PATH=""
-if [ -n "${FILE_PATH}" ]; then
+if [ "${GENERATE}" = "true" ]; then
+  if [ -z "${IMAGE}" ]; then
+    SUBREPO_PATH="${SOURCE_PATH}"
+  fi
+elif [ -n "${FILE_PATH}" ]; then
   if [ -d "${FILE_PATH}" ]; then
     # FILE_PATH is a directory, use it as subrepo path
     SUBREPO_PATH="${FILE_PATH}"
@@ -109,6 +256,9 @@ if [ -n "${FILE_PATH}" ]; then
     # FILE_PATH is a file, extract the directory portion
     SUBREPO_PATH=$(dirname "${FILE_PATH}")
   fi
+fi
+
+if [ -n "${SUBREPO_PATH}" ]; then
   # Normalize: remove leading ./ and trailing /
   SUBREPO_PATH=$(echo "${SUBREPO_PATH}" | sed -E 's|^\./||' | sed -E 's|/$||')
   # If empty or just ".", set to "."
@@ -117,14 +267,28 @@ if [ -n "${FILE_PATH}" ]; then
   fi
 fi
 
-# Set auth endpoint - use token-endpoint if provided, otherwise use default
+# Set auth endpoint - use token-endpoint if provided, otherwise use default.
+# The CLI builds the token URL as "<auth-endpoint>oauth2/token", so the
+# auth-endpoint MUST retain its trailing slash (strip only "oauth2/token",
+# then guarantee a trailing slash).
 if [ -n "${TOKEN_ENDPOINT}" ] && [ "${TOKEN_ENDPOINT}" != "https://auth.us.kusari.cloud/oauth2/token" ]; then
-  # Extract base domain from token endpoint for custom auth endpoints
-  AUTH_ENDPOINT=$(echo "${TOKEN_ENDPOINT}" | sed 's|/oauth2/token||')
+  AUTH_ENDPOINT=$(echo "${TOKEN_ENDPOINT}" | sed 's|oauth2/token$||')
+  case "${AUTH_ENDPOINT}" in
+    */) ;;
+    *) AUTH_ENDPOINT="${AUTH_ENDPOINT}/" ;;
+  esac
 else
   # Use default auth endpoint
   AUTH_ENDPOINT="https://auth.us.kusari.cloud/"
 fi
+
+# Preserve the runner's Docker credential location before relocating HOME.
+# We move HOME to a temp dir to isolate the kusari CLI's config, but waybill
+# (generate mode) resolves registry credentials from $DOCKER_CONFIG, falling
+# back to $HOME/.docker. Without pinning DOCKER_CONFIG here, relocating HOME
+# hides the runner's `docker login` (e.g. ECR) and a remote image pull fails
+# with "401 ... no credentials are configured for this registry".
+export DOCKER_CONFIG="${DOCKER_CONFIG:-${HOME}/.docker}"
 
 # Create a temporary directory for kusari config
 export HOME=$(mktemp -d)
@@ -133,10 +297,49 @@ export HOME=$(mktemp -d)
 echo "Kusari CLI Version:"
 kusari --version
 echo "Logging in to Kusari..."
-kusari auth login \
+# console-url / platform-url are internal-use overrides for non-production
+# (e.g. dev) environments; unset means the CLI's production defaults.
+set -- kusari auth login \
   --client-id="${CLIENT_ID}" \
   --client-secret="${CLIENT_SECRET}" \
   --auth-endpoint="${AUTH_ENDPOINT}"
+if [ -n "${CONSOLE_URL}" ]; then
+  set -- "$@" --console-url="${CONSOLE_URL}"
+fi
+if [ -n "${PLATFORM_URL}" ]; then
+  set -- "$@" --platform-url="${PLATFORM_URL}"
+fi
+"$@"
+
+# In generate mode, produce the SBOM with waybill first, then upload the
+# resulting file via the normal upload codepath below. waybill requires
+# exactly one of --image or --path as the scan target.
+if [ "${GENERATE}" = "true" ]; then
+  if [ -n "${IMAGE}" ]; then
+    echo "Generating SBOM for image ${IMAGE} with kusari platform generate..."
+    SCAN_TARGET_FLAG="--image"
+    SCAN_TARGET_VALUE="${IMAGE}"
+  else
+    echo "Generating SBOM for source path ${SOURCE_PATH} with kusari platform generate..."
+    SCAN_TARGET_FLAG="--path"
+    SCAN_TARGET_VALUE="${SOURCE_PATH}"
+  fi
+  set -- kusari platform generate -- \
+    --output "${OUTPUT_PATH}" \
+    "${SCAN_TARGET_FLAG}" "${SCAN_TARGET_VALUE}"
+  if [ -n "${ROOT_NAME}" ]; then
+    set -- "$@" --root-name "${ROOT_NAME}"
+  fi
+  if [ -n "${ROOT_VERSION}" ]; then
+    set -- "$@" --root-version "${ROOT_VERSION}"
+  fi
+  if [ "${NO_ROOT_PURL}" = "true" ]; then
+    set -- "$@" --no-root-purl
+  fi
+  # shellcheck disable=SC2086
+  "$@" ${WAYBILL_ARGS}
+  FILE_PATH="${OUTPUT_PATH}"
+fi
 
 # Execute upload command
 echo "Uploading to Kusari Platform..."
@@ -147,7 +350,18 @@ set -- kusari platform upload \
   --tenant-endpoint="${TENANT_ENDPOINT}"
 
 # Add optional parameters
+# console-url / platform-url are internal-use overrides for non-production
+# (e.g. dev) environments; unset means the CLI's production defaults.
+if [ -n "${CONSOLE_URL}" ]; then
+  set -- "$@" --console-url="${CONSOLE_URL}"
+fi
+
+if [ -n "${PLATFORM_URL}" ]; then
+  set -- "$@" --platform-url="${PLATFORM_URL}"
+fi
+
 if [ -n "${ALIAS}" ]; then
+  echo "WARNING: the 'alias' input is deprecated: it is not used by the Kusari platform and will be removed in a future release." >&2
   set -- "$@" --alias="${ALIAS}"
 fi
 
@@ -171,10 +385,6 @@ if [ -n "${SBOM_SUBJECT}" ]; then
   set -- "$@" --sbom-subject="${SBOM_SUBJECT}"
 fi
 
-if [ -n "${COMPONENT_NAME}" ]; then
-  set -- "$@" --component-name="${COMPONENT_NAME}"
-fi
-
 if [ "${CHECK_BLOCKED_PACKAGES}" = "true" ]; then
   set -- "$@" --check-blocked-packages
 fi
@@ -185,6 +395,10 @@ fi
 
 if [ -n "${SBOM_SUBJECT_VERSION_OVERRIDE}" ]; then
   set -- "$@" --sbom-subject-version-override="${SBOM_SUBJECT_VERSION_OVERRIDE}"
+fi
+
+if [ -n "${COMMIT_SHA}" ]; then
+  set -- "$@" --commit-sha="${COMMIT_SHA}"
 fi
 
 if [ "${WAIT}" = "false" ]; then
@@ -207,6 +421,14 @@ fi
 
 if [ -n "${SUBREPO_PATH}" ]; then
   set -- "$@" --subrepo-path="${SUBREPO_PATH}"
+fi
+
+if [ -n "${RESULTS_FILE}" ]; then
+  set -- "$@" --results-file="${RESULTS_FILE}"
+fi
+
+if [ "${MAP_COMPONENTS}" = "true" ]; then
+  set -- "$@" --map-components
 fi
 
 # Execute the command

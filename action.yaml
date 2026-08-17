@@ -7,8 +7,45 @@ branding:
 author: 'Kusari'
 inputs:
   file-path:
-    description: 'Path to directory or specific file to ingest'
-    required: true
+    description: 'Path to directory or specific file to ingest. Required when generate is false; must be empty when generate is true (the action uploads the generated SBOM).'
+    required: false
+    default: ""
+  generate:
+    description: 'Generate an SBOM with `kusari platform generate` (via waybill) and upload it, instead of uploading an existing file.'
+    required: false
+    default: "false"
+  source-path:
+    description: 'Source path to scan when generate is true. Passed to waybill as `--path`. Exactly one of `source-path` or `image` is required when generate is true.'
+    required: false
+    default: ""
+  image:
+    description: 'Container image reference (OCI ref or `docker save` tarball path) to scan when generate is true. Passed to waybill as `--image`. Exactly one of `source-path` or `image` is required when generate is true.'
+    required: false
+    default: ""
+  output-path:
+    description: 'Path where the generated SBOM is written (used when generate is true). Passed to waybill as `--output` and then used as the file to upload. Default matches waybill''s CycloneDX default.'
+    required: false
+    default: "project.cdx.json"
+  waybill-args:
+    description: 'Additional flags passed verbatim to `waybill sbom scan` after `--` when generate is true. Avoid overriding `--output` here; use the `output-path` input instead.'
+    required: false
+    default: ""
+  mikebom-args:
+    description: 'DEPRECATED: mikebom was renamed to waybill; use `waybill-args` instead. Treated exactly like `waybill-args`, but ignored when `waybill-args` is also set. Will be removed in a future release.'
+    required: false
+    default: ""
+  root-name:
+    description: 'waybill `--root-name` value used when generate is true. When unset, waybill uses its own auto-derivation.'
+    required: false
+    default: ""
+  root-version:
+    description: 'waybill `--root-version` value used when generate is true. When unset, waybill uses its own auto-derivation.'
+    required: false
+    default: ""
+  no-root-purl:
+    description: 'When "true" and generate is true, pass `--no-root-purl` so waybill emits no root purl. The resulting software has an empty pkg_type (matches syft container-image rows).'
+    required: false
+    default: "false"
   tenant-endpoint:
     description: 'Kusari Platform tenant api endpoint'
     required: true
@@ -22,8 +59,16 @@ inputs:
     description: 'Kusari Platform auth token provider endpoint'
     required: true
     default: https://auth.us.kusari.cloud/oauth2/token
+  console-url:
+    description: 'Internal use only. Console URL override for non-production (e.g. dev) environments. Leave unset for production.'
+    required: false
+    default: ""
+  platform-url:
+    description: 'Internal use only. Platform API URL override for non-production (e.g. dev) environments. Leave unset for production.'
+    required: false
+    default: ""
   alias:
-    description: 'Alias of the package for grouping'
+    description: 'DEPRECATED: not used by the Kusari platform; will be removed in a future release'
     required: false
     default: ""
   document-type:
@@ -43,10 +88,6 @@ inputs:
   sbom-subject:
     description: 'Kusari Platform software SBOM subject substring value that uniquely indicates which software that the document applies to. Currently only used for OpenVex. Example: kusari-ingest'
     required: false
-  component-name:
-    description: 'Kusari Platform software component name (multiple SBOM subjects can belong to the same component). If a component with this name does not exist, it will be created. Optional. Example: kusari-ingest'
-    required: false
-    default: ${{ github.event.repository.name }}
   check-blocked-packages:
     description: Check SBOM dependencies against the Blocked Package list in the Kusari Platform.
     required: false
@@ -59,30 +100,167 @@ inputs:
     description: 'SBOM Subject Version override (optional, for SBOMs only)'
     required: false
     default: ""
+  commit-sha:
+    description: 'Commit SHA to associate with the uploaded document (optional)'
+    required: false
+    default: ${{ github.sha }}
   wait:
     description: 'Wait for ingestion status (default: true)'
     required: false
     default: "true"
+  results-file:
+    description: 'Path to write the machine-readable JSON ingestion results to (software and component IDs per ingested SBOM). Setting this (or map-components) also populates the `results` output; when neither is set the ID lookups are skipped entirely. Requires wait: true.'
+    required: false
+    default: ""
+  map-components:
+    description: 'When "true", passes --map-components to the kusari CLI: after ingestion, each ingested software not already mapped to a Kusari component gets mapped automatically — create (or reuse) a component named after the software and assign the software to it. Requires wait: true (the default).'
+    required: false
+    default: "false"
 outputs:
   console_out:
     description: 'Kusari Platform ingestion output'
+    value: ${{ steps.ingest.outputs.console_out }}
+  results:
+    description: 'Contents of the ingestion results JSON ({"sboms": [...]} with software/component IDs per ingested SBOM). Populated only when the results-file input is set or map-components is true; empty otherwise. When map-components is true, reflects the final post-mapping state.'
+    value: ${{ steps.ingest.outputs.results }}
+
+# Composite action: the kusari CLI runs on the runner host rather than in an
+# isolated container. That lets waybill use the runner's docker daemon and
+# registry credentials, so an `image:` passed as an OCI reference (e.g. one built
+# and pushed earlier in the same job) resolves locally — no tarball export and no
+# WAYBILL_REGISTRY_* credentials to pass. Inputs and entrypoint.sh are unchanged,
+# so callers and the upload path behave exactly as before.
 runs:
-  using: 'docker'
-  image: 'Dockerfile'
-  args:
-    - "--file-path=${{ inputs.file-path }}"
-    - "--client-id=${{ inputs.client-id }}"
-    - "--client-secret=${{ inputs.client-secret }}"
-    - "--tenant-endpoint=${{ inputs.tenant-endpoint }}"
-    - "--token-endpoint=${{ inputs.token-endpoint }}"
-    - "--alias=${{ inputs.alias }}"
-    - "--document-type=${{ inputs.document-type }}"
-    - "--open-vex=${{ inputs.open-vex }}"
-    - "--tag=${{ inputs.tag }}"
-    - "--software-id=${{ inputs.software-id }}"
-    - "--sbom-subject=${{ inputs.sbom-subject }}"
-    - "--component-name=${{ inputs.component-name }}"
-    - "--check-blocked-packages=${{ inputs.check-blocked-packages }}"
-    - "--sbom-subject-name-override=${{ inputs.sbom-subject-name-override }}"
-    - "--sbom-subject-version-override=${{ inputs.sbom-subject-version-override }}"
-    - "--wait=${{ inputs.wait }}"
+  using: 'composite'
+  steps:
+    - name: Install kusari CLI
+      shell: bash
+      env:
+        KUSARI_CLI_VERSION: "2.10.2"   # keep in sync with kusari-cli releases
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          *) echo "kusari-ingest: unsupported runner OS '${RUNNER_OS}'" >&2; exit 1 ;;
+        esac
+        case "${RUNNER_ARCH}" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "kusari-ingest: unsupported runner arch '${RUNNER_ARCH}'" >&2; exit 1 ;;
+        esac
+        [ "${os}" = "darwin" ] && arch=all   # macOS ships a universal archive
+        asset="kusari-cli_${KUSARI_CLI_VERSION}_${os}_${arch}.tar.gz"
+        base="https://github.com/kusaridev/kusari-cli/releases/download/v${KUSARI_CLI_VERSION}"
+        tmp="$(mktemp -d)"
+        curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}"
+        curl -fsSL -o "${tmp}/checksums.txt" "${base}/kusari-cli_${KUSARI_CLI_VERSION}_checksums.txt"
+        (cd "${tmp}" && grep " ${asset}\$" checksums.txt | shasum -a 256 -c -)
+        tar -xzf "${tmp}/${asset}" -C "${tmp}"
+        bin="$(find "${tmp}" -type f -name kusari | head -1)"
+        dest="${RUNNER_TEMP}/kusari-bin"
+        mkdir -p "${dest}"
+        mv "${bin}" "${dest}/kusari"
+        chmod +x "${dest}/kusari"
+        echo "${dest}" >> "${GITHUB_PATH}"
+    - name: Ingest
+      id: ingest
+      shell: bash
+      env:
+        # Pass inputs via env (not interpolated into the command) to avoid shell
+        # injection from input values.
+        INPUT_FILE_PATH: ${{ inputs.file-path }}
+        INPUT_CLIENT_ID: ${{ inputs.client-id }}
+        INPUT_CLIENT_SECRET: ${{ inputs.client-secret }}
+        INPUT_TENANT_ENDPOINT: ${{ inputs.tenant-endpoint }}
+        INPUT_TOKEN_ENDPOINT: ${{ inputs.token-endpoint }}
+        INPUT_CONSOLE_URL: ${{ inputs.console-url }}
+        INPUT_PLATFORM_URL: ${{ inputs.platform-url }}
+        INPUT_ALIAS: ${{ inputs.alias }}
+        INPUT_DOCUMENT_TYPE: ${{ inputs.document-type }}
+        INPUT_OPEN_VEX: ${{ inputs.open-vex }}
+        INPUT_TAG: ${{ inputs.tag }}
+        INPUT_SOFTWARE_ID: ${{ inputs.software-id }}
+        INPUT_SBOM_SUBJECT: ${{ inputs.sbom-subject }}
+        INPUT_CHECK_BLOCKED_PACKAGES: ${{ inputs.check-blocked-packages }}
+        INPUT_SBOM_SUBJECT_NAME_OVERRIDE: ${{ inputs.sbom-subject-name-override }}
+        INPUT_SBOM_SUBJECT_VERSION_OVERRIDE: ${{ inputs.sbom-subject-version-override }}
+        INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
+        INPUT_WAIT: ${{ inputs.wait }}
+        INPUT_GENERATE: ${{ inputs.generate }}
+        INPUT_SOURCE_PATH: ${{ inputs.source-path }}
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_OUTPUT_PATH: ${{ inputs.output-path }}
+        INPUT_WAYBILL_ARGS: ${{ inputs.waybill-args }}
+        INPUT_MIKEBOM_ARGS: ${{ inputs.mikebom-args }}
+        INPUT_ROOT_NAME: ${{ inputs.root-name }}
+        INPUT_ROOT_VERSION: ${{ inputs.root-version }}
+        INPUT_NO_ROOT_PURL: ${{ inputs.no-root-purl }}
+        INPUT_RESULTS_FILE: ${{ inputs.results-file }}
+        INPUT_MAP_COMPONENTS: ${{ inputs.map-components }}
+      run: |
+        set +e   # capture the ingestion output and exit code even on failure
+        log="${RUNNER_TEMP}/kusari-ingest-output.txt"
+        # Results need extra post-ingestion API calls, so collect them only when consumed (results-file or map-components set).
+        if [ -n "${INPUT_RESULTS_FILE}" ]; then
+          results_file="${INPUT_RESULTS_FILE}"          # user's path
+        elif [ "${INPUT_MAP_COMPONENTS}" = "true" ]; then
+          results_file="${RUNNER_TEMP}/kusari-results.json"   # synthesized so mapping results reach the `results` output
+        else
+          results_file=""                               # no consumer -> no lookups
+        fi
+        # Remove any leftover file at the results path before ingesting: the
+        # synthesized path is fixed and RUNNER_TEMP persists across steps, so a
+        # run that fails before the CLI writes would otherwise republish a
+        # previous invocation's IDs as this run's `results`.
+        if [ -n "${results_file}" ]; then
+          rm -f "${results_file}"
+        fi
+        bash "${GITHUB_ACTION_PATH}/entrypoint.sh" \
+          --file-path="${INPUT_FILE_PATH}" \
+          --client-id="${INPUT_CLIENT_ID}" \
+          --client-secret="${INPUT_CLIENT_SECRET}" \
+          --tenant-endpoint="${INPUT_TENANT_ENDPOINT}" \
+          --token-endpoint="${INPUT_TOKEN_ENDPOINT}" \
+          --console-url="${INPUT_CONSOLE_URL}" \
+          --platform-url="${INPUT_PLATFORM_URL}" \
+          --alias="${INPUT_ALIAS}" \
+          --document-type="${INPUT_DOCUMENT_TYPE}" \
+          --open-vex="${INPUT_OPEN_VEX}" \
+          --tag="${INPUT_TAG}" \
+          --software-id="${INPUT_SOFTWARE_ID}" \
+          --sbom-subject="${INPUT_SBOM_SUBJECT}" \
+          --check-blocked-packages="${INPUT_CHECK_BLOCKED_PACKAGES}" \
+          --sbom-subject-name-override="${INPUT_SBOM_SUBJECT_NAME_OVERRIDE}" \
+          --sbom-subject-version-override="${INPUT_SBOM_SUBJECT_VERSION_OVERRIDE}" \
+          --commit-sha="${INPUT_COMMIT_SHA}" \
+          --wait="${INPUT_WAIT}" \
+          --generate="${INPUT_GENERATE}" \
+          --source-path="${INPUT_SOURCE_PATH}" \
+          --image="${INPUT_IMAGE}" \
+          --output-path="${INPUT_OUTPUT_PATH}" \
+          --waybill-args="${INPUT_WAYBILL_ARGS}" \
+          --mikebom-args="${INPUT_MIKEBOM_ARGS}" \
+          --root-name="${INPUT_ROOT_NAME}" \
+          --root-version="${INPUT_ROOT_VERSION}" \
+          --no-root-purl="${INPUT_NO_ROOT_PURL}" \
+          --results-file="${results_file}" \
+          --map-components="${INPUT_MAP_COMPONENTS}" 2>&1 | tee "${log}"
+        status=${PIPESTATUS[0]}
+        # Random per-run heredoc delimiter: the log and results embed
+        # SBOM-derived content, and a fixed delimiter appearing on its own line
+        # would end the heredoc early and let the remaining lines be parsed as
+        # arbitrary output assignments.
+        delim="KUSARI_$(od -An -tx8 -N16 /dev/urandom | tr -d ' \n')"
+        {
+          echo "console_out<<${delim}"
+          cat "${log}"
+          echo "${delim}"
+          echo "results<<${delim}"
+          if [ -n "${results_file}" ] && [ -f "${results_file}" ]; then
+            cat "${results_file}"
+            echo ""   # the CLI's JSON may lack a trailing newline; the heredoc delimiter needs its own line
+          fi
+          echo "${delim}"
+        } >> "${GITHUB_OUTPUT}"
+        exit "${status}"
